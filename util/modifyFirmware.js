@@ -83,19 +83,33 @@ function modifyFirmware() {
 // SEND_STRING macro fired twice. Hence the `oryx_export_` prefix, which cannot
 // collide with any generated `<hook>_<module>` name.
 function renameOryxCallbacks(content) {
-  const renames = [
+  const required = [
     ['bool process_record_user(uint16_t keycode, keyrecord_t *record) {',
       'bool oryx_export_process_record(uint16_t keycode, keyrecord_t *record) {'],
+  ];
+  const optional = [
     ['uint16_t get_tapping_term(uint16_t keycode, keyrecord_t *record) {',
       'uint16_t oryx_export_get_tapping_term(uint16_t keycode, keyrecord_t *record) {'],
   ];
 
   let renamedContent = content;
-  for (const [from, to] of renames) {
+  for (const [from, to] of required) {
     if (!renamedContent.includes(from)) {
       throw new Error(`modifyFirmware: expected Oryx callback not found in keymap.c\n  expected: ${from}`);
     }
     renamedContent = renamedContent.replace(from, to);
+  }
+  for (const [from, to] of optional) {
+    if (renamedContent.includes(from)) {
+      renamedContent = renamedContent.replace(from, to);
+    }
+  }
+  if (!renamedContent.includes('oryx_export_get_tapping_term')) {
+    renamedContent += `
+uint16_t oryx_export_get_tapping_term(uint16_t keycode, keyrecord_t *record) {
+    return TAPPING_TERM;
+}
+`;
   }
 
   return renamedContent;

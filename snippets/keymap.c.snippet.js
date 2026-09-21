@@ -17,6 +17,7 @@ module.exports = {
 
 
 
+#ifdef CHORDAL_HOLD
 // Chordal Hold: when another key is pressed before the tapping term, decide
 // whether the tap-hold key may still settle as held. Returning true only
 // *permits* a hold (the tapping term / permissive-hold / hold-on-other-key-press
@@ -45,6 +46,7 @@ bool get_chordal_hold(uint16_t tap_hold_keycode,
   // tap; opposite-hand and any '*' thumb neighbour is permitted to hold.
   return get_chordal_hold_default(tap_hold_record, other_record);
 }
+#endif
 
 
 
@@ -115,11 +117,15 @@ static bool is_shift_mod_tap(uint16_t keycode) {
 
 static uint8_t hand_bit_of_event(keyevent_t event) {
     if (!IS_KEYEVENT(event)) return 0;
+#ifdef CHORDAL_HOLD
     switch (chordal_hold_handedness(event.key)) {
         case 'L': return SHIFT_HAND_LEFT;
         case 'R': return SHIFT_HAND_RIGHT;
         default:  return 0;
     }
+#else
+    return 0;
+#endif
 }
 
 // The real modifier byte this mod-tap registers when it settles as a hold.
@@ -378,6 +384,345 @@ static void apply_same_hand_shift_guard(uint16_t keycode, keyrecord_t *record) {
     stripped_shift_key  = record->event.key;
 }
 
+// Oryx .../1/50: layer 1, right thumb inner. Double-tap sends ". " and a
+// one-shot Shift so the next letter is capitalised; single tap keeps whatever
+// Oryx assigned. Matched on the layer the keycode came from so a transparent
+// layer-1 cell still falls through to the base-layer thumb untouched.
+#define SENTENCE_END_LAYER 1
+#define SENTENCE_END_ROW   11
+#define SENTENCE_END_COL   5
+#define SENTENCE_DOUBLE_TAP_TERM 250
+
+static deferred_token sentence_end_token = INVALID_DEFERRED_TOKEN;
+static uint16_t       sentence_end_tap_kc = KC_NO;
+static uint16_t       sentence_space_tap_time = 0;
+static bool           sentence_space_tapped = false;
+static bool           sentence_space_skip_release = false;
+static bool           sentence_after_space = false;
+static bool           sentence_start_pending = false;
+static uint8_t        pronoun_state = 0;
+
+#define PRONOUN_NONE 0
+#define PRONOUN_I    1
+#define PRONOUN_IM   2
+#define PRONOUN_APOS 3
+
+static bool is_sentence_end_switch(keyrecord_t *record) {
+    return record->event.key.row == SENTENCE_END_ROW &&
+           record->event.key.col == SENTENCE_END_COL;
+}
+
+static void send_sentence_end(bool replace_leading_space) {
+    if (replace_leading_space) {
+        tap_code(KC_BSPC);
+    }
+    tap_code(KC_DOT);
+    tap_code(KC_SPC);
+    set_oneshot_mods(MOD_BIT(KC_LSFT));
+    sentence_start_pending     = true;
+    sentence_after_space       = false;
+    pronoun_state              = PRONOUN_NONE;
+}
+
+static uint16_t sentence_end_unwrap(uint16_t keycode) {
+    if (IS_QK_MOD_TAP(keycode))   return QK_MOD_TAP_GET_TAP_KEYCODE(keycode);
+    if (IS_QK_LAYER_TAP(keycode)) return QK_LAYER_TAP_GET_TAP_KEYCODE(keycode);
+    return keycode;
+}
+
+static uint32_t sentence_end_single_tap(uint32_t trigger_time, void *cb_arg) {
+    (void)trigger_time;
+    (void)cb_arg;
+    const uint16_t tap_kc = sentence_end_tap_kc;
+    sentence_end_token  = INVALID_DEFERRED_TOKEN;
+    sentence_end_tap_kc = KC_NO;
+    if (tap_kc > KC_NO && tap_kc < QK_MODS) {
+        tap_code16(tap_kc);
+    }
+    return 0;
+}
+
+static bool process_sentence_end_key(uint16_t keycode, keyrecord_t *record) {
+    if (!is_sentence_end_switch(record)) {
+        return true;
+    }
+
+    const bool from_layer_1 = layer_switch_get_layer(record->event.key) == SENTENCE_END_LAYER;
+    const bool in_progress  = sentence_end_token != INVALID_DEFERRED_TOKEN || sentence_end_tap_kc != KC_NO;
+    if (!from_layer_1 && !in_progress) {
+        return true;
+    }
+
+    if (!record->event.pressed) {
+        if (sentence_end_token == INVALID_DEFERRED_TOKEN && sentence_end_tap_kc != KC_NO) {
+            sentence_end_token = defer_exec(SENTENCE_DOUBLE_TAP_TERM, sentence_end_single_tap, NULL);
+        }
+        return false;
+    }
+
+    if (sentence_end_token != INVALID_DEFERRED_TOKEN) {
+        cancel_deferred_exec(sentence_end_token);
+        sentence_end_token  = INVALID_DEFERRED_TOKEN;
+        sentence_end_tap_kc = KC_NO;
+        send_sentence_end(false);
+        return false;
+    }
+
+    sentence_end_tap_kc = sentence_end_unwrap(keycode);
+    return false;
+}
+
+// Oryx 0/50 is the same switch as Space tap / Shift hold. The first tap and
+// any hold still go to Oryx unchanged; only a second tap (already decided as
+// a tap, the same as typing two spaces) is rewritten to ". " + one-shot Shift.
+static bool process_base_sentence_end_tap(uint16_t keycode, keyrecord_t *record) {
+    (void)keycode;
+    const bool is_key = is_sentence_end_switch(record) &&
+                        layer_switch_get_layer(record->event.key) == 0;
+
+    if (!record->event.pressed) {
+        if (is_key && sentence_space_skip_release) {
+            sentence_space_skip_release = false;
+            return false;
+        }
+        return true;
+    }
+
+    if (!is_key) {
+        sentence_space_tapped = false;
+        return true;
+    }
+
+    if (record->tap.count == 0) {
+        sentence_space_tapped = false;
+        return true;
+    }
+
+    if (sentence_space_tapped &&
+        timer_elapsed(sentence_space_tap_time) < SENTENCE_DOUBLE_TAP_TERM) {
+        sentence_space_tapped       = false;
+        sentence_space_skip_release = true;
+        send_sentence_end(true);
+        return false;
+    }
+
+    sentence_space_tapped   = true;
+    sentence_space_tap_time = timer_read();
+    return true;
+}
+
+static uint16_t sentence_tap_letter(uint16_t keycode) {
+    const uint16_t tap_kc = sentence_end_unwrap(keycode);
+    if (tap_kc >= KC_A && tap_kc <= KC_Z) return tap_kc;
+    return KC_NO;
+}
+
+static bool is_apostrophe_tap(uint16_t keycode, keyrecord_t *record) {
+    if (IS_QK_MOD_TAP(keycode) && record->tap.count == 0) return false;
+    return sentence_end_unwrap(keycode) == KC_QUOTE;
+}
+
+static void pronoun_type_im(void) {
+    tap_code(KC_BSPC);
+    tap_code(KC_QUOTE);
+    tap_code(KC_M);
+}
+
+static void pronoun_undo_i(void) {
+    tap_code(KC_BSPC);
+    tap_code(KC_I);
+}
+
+static void pronoun_undo_im(void) {
+    tap_code(KC_BSPC);
+    tap_code(KC_BSPC);
+    tap_code(KC_I);
+    tap_code(KC_M);
+}
+
+// After a Space tap, treat a lone "i" as "I". "I'm" keeps the capital even when
+// quote is a shift mod-tap and m lands first. Other letters undo the capital
+// so it/in/if/image stay lowercase. Not used right after ". ".
+static bool process_pronoun_i(uint16_t keycode, keyrecord_t *record) {
+    if (!record->event.pressed) return true;
+
+    if ((get_mods() & ~MOD_MASK_SHIFT) != 0) {
+        sentence_after_space   = false;
+        sentence_start_pending = false;
+        pronoun_state          = PRONOUN_NONE;
+        return true;
+    }
+
+    const uint16_t letter = sentence_tap_letter(keycode);
+    const uint16_t tap_kc = sentence_end_unwrap(keycode);
+
+    if (sentence_start_pending) {
+        if (letter != KC_NO || tap_kc == KC_SPC) {
+            sentence_start_pending = false;
+        }
+        return true;
+    }
+
+    if (pronoun_state == PRONOUN_I) {
+        if (is_apostrophe_tap(keycode, record)) {
+            pronoun_state = PRONOUN_APOS;
+            return true;
+        }
+        if (letter == KC_M) {
+            pronoun_state = PRONOUN_IM;
+            return true;
+        }
+        if (letter != KC_NO) {
+            pronoun_undo_i();
+        }
+        pronoun_state = PRONOUN_NONE;
+        if (tap_kc == KC_SPC) sentence_after_space = true;
+        return true;
+    }
+
+    if (pronoun_state == PRONOUN_IM) {
+        if (is_apostrophe_tap(keycode, record)) {
+            pronoun_type_im();
+            pronoun_state = PRONOUN_NONE;
+            return false;
+        }
+        if (letter != KC_NO) {
+            pronoun_undo_im();
+            pronoun_state = PRONOUN_NONE;
+            return true;
+        }
+        pronoun_undo_im();
+        pronoun_state = PRONOUN_NONE;
+        if (tap_kc == KC_SPC) sentence_after_space = true;
+        return true;
+    }
+
+    if (pronoun_state == PRONOUN_APOS) {
+        pronoun_state = PRONOUN_NONE;
+        if (tap_kc == KC_SPC) sentence_after_space = true;
+        return true;
+    }
+
+    if (tap_kc == KC_SPC) {
+        sentence_after_space = true;
+        return true;
+    }
+
+    if (sentence_after_space && letter == KC_I) {
+        sentence_after_space = false;
+        if ((get_mods() & MOD_MASK_SHIFT) == 0) {
+            pronoun_state = PRONOUN_I;
+            set_oneshot_mods(MOD_BIT(KC_LSFT));
+        }
+        return true;
+    }
+
+    sentence_after_space = false;
+    return true;
+}
+
+// Oryx 0/25 left thumb outer (Ctrl hold / Enter tap), 0/51 right thumb outer
+// (layer 2 hold / Backspace tap). Hold 0/25 then tap 0/51 deletes the current
+// line; double-tap 0/51 deletes the previous word. A single tap and a hold on
+// either key stay with Oryx.
+#define WORD_DEL_HOLD_ROW 5
+#define WORD_DEL_HOLD_COL 1
+#define WORD_DEL_TAP_ROW  11
+#define WORD_DEL_TAP_COL  6
+
+static bool word_del_mod_held      = false;
+static bool word_del_skip_release  = false;
+static bool word_del_tapped        = false;
+static uint16_t word_del_tap_time  = 0;
+
+static bool host_is_apple(void) {
+    switch (detected_host_os()) {
+        case OS_WINDOWS:
+        case OS_LINUX:
+            return false;
+        case OS_MACOS:
+        case OS_IOS:
+            return true;
+        default:
+            return keymap_config.swap_lctl_lgui;
+    }
+}
+
+static void send_word_delete(void) {
+    const uint8_t mods = get_mods();
+    clear_mods();
+    send_keyboard_report();
+    tap_code16(host_is_apple() ? LALT(KC_BSPC) : LCTL(KC_BSPC));
+    set_mods(mods);
+    send_keyboard_report();
+}
+
+static void send_line_delete(void) {
+    const uint8_t mods = get_mods();
+    clear_mods();
+    send_keyboard_report();
+    if (host_is_apple()) {
+        tap_code16(LGUI(KC_LEFT));
+        tap_code16(LSFT(LGUI(KC_RGHT)));
+    } else {
+        tap_code(KC_HOME);
+        tap_code16(LSFT(KC_END));
+    }
+    tap_code(KC_BSPC);
+    set_mods(mods);
+    send_keyboard_report();
+}
+
+static bool process_word_delete_chord(uint16_t keycode, keyrecord_t *record) {
+    const uint8_t row = record->event.key.row;
+    const uint8_t col = record->event.key.col;
+
+    if (row == WORD_DEL_HOLD_ROW && col == WORD_DEL_HOLD_COL) {
+        if (!record->event.pressed) {
+            word_del_mod_held = false;
+            return true;
+        }
+        word_del_mod_held = IS_QK_MOD_TAP(keycode) && record->tap.count == 0;
+        return true;
+    }
+
+    if (row != WORD_DEL_TAP_ROW || col != WORD_DEL_TAP_COL) {
+        if (record->event.pressed) word_del_tapped = false;
+        return true;
+    }
+
+    if (!record->event.pressed) {
+        if (word_del_skip_release) {
+            word_del_skip_release = false;
+            return false;
+        }
+        return true;
+    }
+
+    if (IS_QK_LAYER_TAP(keycode) && record->tap.count == 0) {
+        word_del_tapped = false;
+        return true;
+    }
+
+    if (word_del_mod_held) {
+        word_del_tapped       = false;
+        word_del_skip_release = true;
+        send_line_delete();
+        return false;
+    }
+
+    if (word_del_tapped && timer_elapsed(word_del_tap_time) < SENTENCE_DOUBLE_TAP_TERM) {
+        word_del_tapped       = false;
+        word_del_skip_release = true;
+        send_word_delete();
+        return false;
+    }
+
+    word_del_tapped   = true;
+    word_del_tap_time = timer_read();
+    return true;
+}
+
 // Oryx owns process_record_user() and get_tapping_term() in the export;
 // modifyFirmware.js renames them to oryx_export_* so these wrappers can front
 // them. The prefix is deliberately not an _oryx suffix: QMK generates a weak
@@ -385,12 +730,25 @@ static void apply_same_hand_shift_guard(uint16_t keycode, keyrecord_t *record) {
 // process_record_oryx() is already called by process_record_modules() on every
 // key event -- defining it here would run the export's macro switch twice.
 bool process_record_user(uint16_t keycode, keyrecord_t *record) {
+    if (!process_sentence_end_key(keycode, record)) {
+        return false;
+    }
+    if (!process_base_sentence_end_tap(keycode, record)) {
+        return false;
+    }
+    if (!process_pronoun_i(keycode, record)) {
+        return false;
+    }
+    if (!process_word_delete_chord(keycode, record)) {
+        return false;
+    }
     apply_same_hand_shift_guard(keycode, record);
     return oryx_export_process_record(keycode, record);
 }
 
 uint16_t get_tapping_term(uint16_t keycode, keyrecord_t *record) {
-    if (is_shift_mod_tap(keycode) &&
+    if (!is_sentence_end_switch(record) &&
+        is_shift_mod_tap(keycode) &&
         (shift_out_of_flow_hands & hand_bit_of_event(record->event)) != 0) {
         return SHIFT_OUT_OF_FLOW_HOLD_TERM;
     }
