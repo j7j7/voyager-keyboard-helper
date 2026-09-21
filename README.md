@@ -69,6 +69,65 @@ Nothing here re-implements Oryx — it appends to the export.
 
 ---
 
+## Custom behaviours on this fork
+
+These are injected from [`snippets/keymap.c.snippet.js`](snippets/keymap.c.snippet.js) on every flash. They are keyed to **physical Voyager switches** (Oryx URL `layer/key`). Single-tap and hold on those keys stay whatever Oryx assigned; only the extra gestures below are added.
+
+Oryx **key 50** is the right inner thumb. **Key 51** is the right outer thumb. **Key 25** is the left outer thumb.
+
+In the current layout that is:
+
+| Oryx | Physical key | Oryx assignment |
+|---|---|---|
+| 0/50 | Right inner thumb | Space tap, Left Shift hold |
+| 1/50 | Same switch, layer 1 | `ST_MACRO_0` (or whatever you put there) |
+| 0/25 | Left outer thumb | Enter tap, Ctrl hold |
+| 0/51 | Right outer thumb | Backspace tap, layer 2 hold |
+
+### Sentence end (`. ` + capital)
+
+**Double-tap 0/50.** The first tap is still Space. The second tap (already decided as a tap, the same as typing two spaces) is rewritten: backspace the first space, type `. `, then one-shot Shift so the next letter is capital.
+
+Hold on 0/50 is still Shift. Timing is not retuned.
+
+**Double-tap 1/50** on the same switch, when the binding actually comes from layer 1: the first tap is delayed ~250 ms, a second tap sends `. ` + one-shot Shift, a single tap still fires the Oryx key. A transparent layer-1 cell is left alone so the base-layer thumb is not stolen.
+
+### Auto-capital `I`
+
+After a Space tap, a **lone `i`** is typed as **`I`**.
+
+- `and i went` → `and I went`
+- `I'm` keeps the capital, including when `m` lands before the apostrophe key (Shift-when-held quote) has settled
+- `it` / `in` / `image` go back to lowercase if more letters follow
+
+This does not run right after a double-tap sentence end; that already uses one-shot Shift for the next word (`It` stays `It`).
+
+### Word delete and line delete
+
+| Gesture | Result |
+|---|---|
+| Double-tap **0/51** | Delete the previous **word** |
+| Hold **0/25** (until Ctrl settles), then tap **0/51** | Delete the current **line** |
+
+Single tap on 0/51 is still Backspace. Hold on 0/51 is still layer 2. Tap/hold on 0/25 is still Enter/Ctrl.
+
+The keyboard detects the host OS over USB:
+
+| | macOS / iOS | Windows / Linux |
+|---|---|---|
+| Word | Option+Backspace | Ctrl+Backspace |
+| Line | Cmd+Left, Cmd+Shift+Right, Backspace | Home, Shift+End, Backspace |
+
+If the OS is not detected yet, it falls back to QMK `swap_lctl_lgui` (Oryx Mac/Win). Plug in, wait a moment, or replug if the wrong shortcut fires. Some apps (terminals) use their own bindings.
+
+### Export compatibility
+
+This Oryx export has no `get_tapping_term` and no Chordal Hold. The helper treats those as optional: a stub tapping-term is injected if missing, and Chordal Hold callbacks are compiled only when the feature is on, so Space/Shift on 0/50 is not retuned.
+
+Use the **QMK source** zip from Oryx (`*_j7-fork_source.zip`), not the `.bin`. Flash with `./flashKeyboard.sh` or `node updateKeyboard.js`.
+
+---
+
 ## How the tap/hold decision works
 
 This is the heart of the project, so it's worth understanding. When you press a
